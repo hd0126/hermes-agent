@@ -2115,6 +2115,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         return agent._try_activate_fallback(reason)  # try next in chain
 
 
+def _format_resumable_iteration_handoff(summary: str, session_id: object) -> str:
+    """Add deterministic resume metadata to a model-written iteration summary."""
+    body = str(summary or "").strip() or "No summary was available."
+    resolved_session_id = str(session_id or "unknown")
+    return (
+        f"{body}\n\n"
+        "---\n"
+        "Iteration-limit handoff\n"
+        "- Completed: Only work explicitly described as completed above.\n"
+        "- Verified: Only checks explicitly described as verified above.\n"
+        "- Remaining: Anything not explicitly completed and verified above.\n"
+        f"- Session ID: {resolved_session_id}\n"
+        "- Continue: Reply `계속` in this same session."
+    )
+
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
@@ -2144,8 +2159,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     summary_request = (
         "You've reached the maximum number of tool-calling iterations allowed. "
-        "Please provide a final response summarizing what you've found and accomplished so far, "
-        "without calling any more tools."
+        "Without calling any more tools, provide a concise handoff stating what was "
+        "completed, what was actually verified, and what remains. Include the current "
+        "session id and tell the user they can reply '계속' to continue in the same "
+        "session. Do not claim the task is complete if work remains. "
+        f"Current session id: {agent.session_id or 'unknown'}."
     )
     messages.append({"role": "user", "content": summary_request})
 
@@ -2440,6 +2458,21 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_api_request_id,
             outcome=summary_call_outcome,
         )
+
+    raw_final_response = final_response
+    final_response = _format_resumable_iteration_handoff(
+        raw_final_response,
+        getattr(agent, "session_id", None),
+    )
+    tail = messages[-1] if messages else None
+    if (
+        isinstance(tail, dict)
+        and tail.get("role") == "assistant"
+        and tail.get("content") == raw_final_response
+    ):
+        tail["content"] = final_response
+    elif not isinstance(tail, dict) or tail.get("role") != "assistant":
+        messages.append({"role": "assistant", "content": final_response})
 
     return final_response
 

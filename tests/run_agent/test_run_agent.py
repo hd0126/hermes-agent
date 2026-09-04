@@ -2464,6 +2464,31 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
+    def test_summary_request_requires_resumable_handoff(self, agent):
+        resp = _mock_response(content="Handoff")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        agent.session_id = "session-123"
+
+        messages = [{"role": "user", "content": "do stuff"}]
+        result = agent._handle_max_iterations(messages, 32)
+
+        assert result.startswith("Handoff")
+        assert "Completed:" in result
+        assert "Verified:" in result
+        assert "Remaining:" in result
+        assert "session-123" in result
+        assert "계속" in result
+        assert messages[-1] == {"role": "assistant", "content": result}
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        request = sent[-1]["content"]
+        assert "completed" in request
+        assert "verified" in request
+        assert "remains" in request
+        assert "session-123" in request
+        assert "계속" in request
+        assert "Do not claim the task is complete" in request
+
     def test_summary_retries_share_relay_identity(self, agent):
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content=""),
@@ -2485,7 +2510,7 @@ class TestHandleMaxIterations:
                 60,
             )
 
-        assert result == "Summary"
+        assert result.startswith("Summary")
         assert [call["metadata"]["retry_count"] for call in relay_calls] == [0, 1]
         assert relay_calls[0]["metadata"]["api_request_id"] == (
             relay_calls[1]["metadata"]["api_request_id"]
@@ -2497,15 +2522,22 @@ class TestHandleMaxIterations:
             outcome="success",
         )
 
-    def test_api_failure_returns_error(self, agent):
+    def test_api_failure_returns_resumable_error_handoff(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."
+        agent.session_id = "session-error"
         messages = [{"role": "user", "content": "do stuff"}]
         with patch("agent.relay_llm.complete_logical_call") as complete_logical:
             result = agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
         assert "error" in result.lower()
         assert "API down" in result
+        assert "Completed:" in result
+        assert "Verified:" in result
+        assert "Remaining:" in result
+        assert "session-error" in result
+        assert "계속" in result
+        assert messages[-1] == {"role": "assistant", "content": result}
         complete_logical.assert_called_once()
         assert complete_logical.call_args.kwargs == {"outcome": "failed"}
 
@@ -2519,7 +2551,7 @@ class TestHandleMaxIterations:
 
         result = agent._handle_max_iterations(messages, 60)
 
-        assert result == "Summary"
+        assert result.startswith("Summary")
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         assert "reasoning" not in kwargs.get("extra_body", {})
 
@@ -2540,7 +2572,7 @@ class TestHandleMaxIterations:
 
         result = agent._handle_max_iterations(messages, 120)
 
-        assert result == "Summary of work done."
+        assert result.startswith("Summary of work done.")
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         sent_msgs = kwargs.get("messages", [])
         orphan_ids = [
@@ -2573,7 +2605,7 @@ class TestHandleMaxIterations:
 
         result = agent._handle_max_iterations(messages, 60)
 
-        assert result == "Summary"
+        assert result.startswith("Summary")
         sent_msgs = agent.client.chat.completions.create.call_args.kwargs.get("messages", [])
         for m in sent_msgs:
             assert "tool_name" not in m, m
@@ -2624,7 +2656,7 @@ class TestHandleMaxIterations:
         with patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream):
             result = agent._handle_max_iterations(messages, 90)
 
-        assert result == "Summary"
+        assert result.startswith("Summary")
         input_items = captured["input"]
         assert not any(
             item.get("type") == "function_call_output"

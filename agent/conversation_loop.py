@@ -90,6 +90,26 @@ from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
+
+
+def _context_usage_dict(*, aggregator_usage, reported_usage) -> dict[str, int]:
+    """Build acting-model context usage without MoA advisor fan-out.
+
+    ``reported_usage`` remains the source for session/accounting totals, while
+    the context compressor must observe only the aggregator request that
+    actually occupies its context window.
+    """
+    usage = aggregator_usage if aggregator_usage is not None else reported_usage
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+    }
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -3268,20 +3288,14 @@ def run_conversation(
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
-                    # Forward canonical token + cache buckets so context engines
-                    # can make decisions on cache hit ratios / reasoning costs,
-                    # not just legacy aggregate tokens. Legacy keys stay for
-                    # back-compat with engines that only read prompt/completion/total.
-                    usage_dict = {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens,
-                        "input_tokens": canonical_usage.input_tokens,
-                        "output_tokens": canonical_usage.output_tokens,
-                        "cache_read_tokens": canonical_usage.cache_read_tokens,
-                        "cache_write_tokens": canonical_usage.cache_write_tokens,
-                        "reasoning_tokens": canonical_usage.reasoning_tokens,
-                    }
+                    # The reported/session totals include MoA advisor fan-out,
+                    # but those independent advisor requests do not occupy the
+                    # acting aggregator's context window. Feed only aggregator
+                    # usage to context management and the runtime footer.
+                    usage_dict = _context_usage_dict(
+                        aggregator_usage=aggregator_usage,
+                        reported_usage=canonical_usage,
+                    )
                     agent.context_compressor.update_from_response(usage_dict)
 
                     # Stash this response's canonical usage so the post-turn

@@ -15,10 +15,13 @@ Available fields:
     model        — bare model id, vendor prefix dropped (``gpt-5.4``)
     context_pct  — last-call context occupancy as a percent (``5%``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
+    codex_week   — cached Codex weekly usage, when the account API provides it
     cwd          — home-relative working dir (``~``)
 
-``latency`` is opt-in: it is NOT in the default field set, so a footer whose
-``fields`` are unset renders exactly as before.
+``latency`` and ``codex_week`` are opt-in: they are NOT in the default field
+set, so a footer whose ``fields`` are unset renders exactly as before. Codex
+account usage refreshes in a daemon thread and is cached for five minutes; the
+reply hot path never waits for that network request.
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -35,10 +38,81 @@ piecemeal, the footer is sent as a separate trailing message via
 from __future__ import annotations
 
 import os
+import threading
+import time
+from contextvars import copy_context
+from functools import partial
 from typing import Any, Iterable, Optional
+
+from agent.account_usage import fetch_account_usage
+from hermes_constants import get_hermes_home
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+_ACCOUNT_USAGE_CACHE_LOCK = threading.Lock()
+_ACCOUNT_USAGE_CACHE: dict[str, tuple[float, Optional[float]]] = {}
+_ACCOUNT_USAGE_REFRESHING: set[str] = set()
+
+
+def _account_usage_cache_key() -> str:
+    """Return the stable profile identity for the active runtime scope."""
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(get_hermes_home()))))
+
+
+def clear_account_usage_cache() -> None:
+    """Clear all process-local Codex usage caches (primarily for tests)."""
+    with _ACCOUNT_USAGE_CACHE_LOCK:
+        _ACCOUNT_USAGE_CACHE.clear()
+        _ACCOUNT_USAGE_REFRESHING.clear()
+
+
+def _refresh_codex_week_usage(cache_key: str) -> None:
+    value: Optional[float] = None
+    try:
+        snapshot = fetch_account_usage("openai-codex")
+        if snapshot and snapshot.available:
+            for window in snapshot.windows:
+                if window.label.strip().lower() == "weekly" and window.used_percent is not None:
+                    value = float(window.used_percent)
+                    break
+    except Exception:
+        value = None
+    finally:
+        with _ACCOUNT_USAGE_CACHE_LOCK:
+            _ACCOUNT_USAGE_CACHE[cache_key] = (time.monotonic(), value)
+            _ACCOUNT_USAGE_REFRESHING.discard(cache_key)
+
+
+def get_cached_codex_week_used_percent(*, ttl_seconds: float = 300.0) -> Optional[float]:
+    """Return profile-scoped Codex weekly usage without blocking the reply path.
+
+    The refresh worker inherits the caller's contextvars so multiplexed profiles
+    retain their Hermes-home and secret scopes. Failed and incomplete lookups are
+    cached as ``None`` too, avoiding repeated requests for an unavailable endpoint.
+    """
+    cache_key = _account_usage_cache_key()
+    now = time.monotonic()
+    with _ACCOUNT_USAGE_CACHE_LOCK:
+        cached = _ACCOUNT_USAGE_CACHE.get(cache_key)
+        if cached and now - cached[0] < max(0.0, ttl_seconds):
+            return cached[1]
+        stale_value = cached[1] if cached else None
+        if cache_key not in _ACCOUNT_USAGE_REFRESHING:
+            _ACCOUNT_USAGE_REFRESHING.add(cache_key)
+            target = partial(
+                copy_context().run,
+                _refresh_codex_week_usage,
+                cache_key,
+            )
+            try:
+                threading.Thread(
+                    target=target,
+                    daemon=True,
+                    name="hermes-codex-usage-refresh",
+                ).start()
+            except Exception:
+                _ACCOUNT_USAGE_REFRESHING.discard(cache_key)
+        return stale_value
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -115,6 +189,7 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    codex_week_used_percent: Optional[float] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -137,6 +212,10 @@ def format_runtime_footer(
             # timing (call sites that don't measure) or the value is negative.
             if turn_seconds is not None and turn_seconds >= 0:
                 parts.append(_format_latency(turn_seconds))
+        elif field == "codex_week":
+            if codex_week_used_percent is not None:
+                used = max(0, min(100, round(float(codex_week_used_percent))))
+                parts.append(f"Codex week {used}% used / {100 - used}% left")
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
@@ -171,11 +250,16 @@ def build_footer_line(
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
         return ""
+    fields = cfg.get("fields") or _DEFAULT_FIELDS
+    codex_week_used_percent = (
+        get_cached_codex_week_used_percent() if "codex_week" in fields else None
+    )
     return format_runtime_footer(
         model=model,
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
-        fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        codex_week_used_percent=codex_week_used_percent,
+        fields=fields,
     )

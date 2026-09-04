@@ -4,8 +4,11 @@ appended to final gateway replies."""
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 import pytest
+
+from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
 
 from gateway.runtime_footer import (
     _home_relative_cwd,
@@ -244,6 +247,215 @@ def test_build_footer_line_threads_turn_seconds(monkeypatch):
         turn_seconds=22.0,
     )
     assert out == "gpt-5.4 · 22s"
+
+
+def test_format_footer_codex_week_renders_used_and_remaining():
+    out = format_runtime_footer(
+        model="gpt-5.6-sol",
+        context_tokens=68_000,
+        context_length=100_000,
+        cwd="",
+        turn_seconds=22.0,
+        codex_week_used_percent=61.0,
+        fields=("context_pct", "latency", "codex_week"),
+    )
+    assert out == "68% · 22s · Codex week 61% used / 39% left"
+
+
+def test_format_footer_codex_week_skips_missing_usage():
+    out = format_runtime_footer(
+        model="gpt-5.6-sol",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        codex_week_used_percent=None,
+        fields=("codex_week",),
+    )
+    assert out == ""
+
+
+def test_cached_codex_week_usage_refreshes_off_hot_path(monkeypatch):
+    from gateway import runtime_footer
+
+    calls = []
+    targets = []
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=datetime.now(timezone.utc),
+        windows=(AccountUsageWindow(label="Weekly", used_percent=61.0),),
+    )
+
+    class DeferredThread:
+        def __init__(self, *, target, daemon, name):
+            assert daemon is True
+            targets.append(target)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(runtime_footer.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(
+        runtime_footer,
+        "fetch_account_usage",
+        lambda provider: calls.append(provider) or snapshot,
+    )
+    runtime_footer.clear_account_usage_cache()
+
+    # The first footer render never performs the network fetch inline.
+    assert runtime_footer.get_cached_codex_week_used_percent(ttl_seconds=300) is None
+    assert calls == []
+    assert len(targets) == 1
+
+    # Simulate completion of the background refresh; subsequent renders reuse it.
+    targets[0]()
+    assert calls == ["openai-codex"]
+    assert runtime_footer.get_cached_codex_week_used_percent(ttl_seconds=300) == 61.0
+    assert calls == ["openai-codex"]
+
+
+def test_cached_codex_week_usage_is_profile_scoped_and_inherits_context(monkeypatch):
+    from agent.secret_scope import (
+        current_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from gateway import runtime_footer
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    targets = []
+    observations = []
+
+    class DeferredThread:
+        def __init__(self, *, target, daemon, name):
+            assert daemon is True
+            targets.append(target)
+
+        def start(self):
+            return None
+
+    def fake_fetch(_provider):
+        scope = current_secret_scope()
+        observations.append((str(get_hermes_home()), dict(scope or {})))
+        used = 11.0 if scope and scope.get("TEST_PROFILE") == "a" else 22.0
+        return AccountUsageSnapshot(
+            provider="openai-codex",
+            source="usage_api",
+            fetched_at=datetime.now(timezone.utc),
+            windows=(AccountUsageWindow(label="Weekly", used_percent=used),),
+        )
+
+    monkeypatch.setattr(runtime_footer.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(runtime_footer, "fetch_account_usage", fake_fetch)
+    runtime_footer.clear_account_usage_cache()
+
+    def schedule(profile, marker):
+        home_token = set_hermes_home_override(profile)
+        secret_token = set_secret_scope({"TEST_PROFILE": marker})
+        try:
+            return runtime_footer.get_cached_codex_week_used_percent()
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+
+    assert schedule("/tmp/profile-a", "a") is None
+    targets.pop(0)()
+    assert schedule("/tmp/profile-b", "b") is None
+    targets.pop(0)()
+
+    assert observations == [
+        ("/tmp/profile-a", {"TEST_PROFILE": "a"}),
+        ("/tmp/profile-b", {"TEST_PROFILE": "b"}),
+    ]
+    assert schedule("/tmp/profile-a", "a") == 11.0
+    assert schedule("/tmp/profile-b", "b") == 22.0
+
+
+def test_cached_codex_week_usage_fails_silently(monkeypatch):
+    from gateway import runtime_footer
+
+    def fail(_provider):
+        raise RuntimeError("usage backend unavailable")
+
+    monkeypatch.setattr(runtime_footer, "fetch_account_usage", fail)
+    runtime_footer.clear_account_usage_cache()
+    assert runtime_footer.get_cached_codex_week_used_percent() is None
+
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["context_pct", "latency", "codex_week"],
+                }
+            }
+        },
+        platform_key="discord",
+        model="gpt-5.6-sol",
+        context_tokens=68_000,
+        context_length=100_000,
+        turn_seconds=22.0,
+    )
+    assert out == "68% · 22s"
+
+
+def test_build_footer_line_fetches_weekly_only_when_field_enabled(monkeypatch):
+    from gateway import runtime_footer
+
+    calls = []
+    monkeypatch.setattr(
+        runtime_footer,
+        "get_cached_codex_week_used_percent",
+        lambda: calls.append(True) or 61.0,
+    )
+    config = {
+        "display": {
+            "runtime_footer": {
+                "enabled": True,
+                "fields": ["context_pct", "latency", "codex_week"],
+            }
+        }
+    }
+    out = build_footer_line(
+        user_config=config,
+        platform_key="discord",
+        model="gpt-5.6-sol",
+        context_tokens=68_000,
+        context_length=100_000,
+        turn_seconds=22.0,
+    )
+    assert out == "68% · 22s · Codex week 61% used / 39% left"
+    assert calls == [True]
+
+
+def test_build_footer_line_avoids_usage_fetch_when_field_disabled(monkeypatch):
+    from gateway import runtime_footer
+
+    monkeypatch.setattr(
+        runtime_footer,
+        "get_cached_codex_week_used_percent",
+        lambda: pytest.fail("usage API should not be consulted"),
+    )
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["context_pct", "latency"],
+                }
+            }
+        },
+        platform_key="discord",
+        model="gpt-5.6-sol",
+        context_tokens=68_000,
+        context_length=100_000,
+        turn_seconds=22.0,
+    )
+    assert out == "68% · 22s"
 
 
 # ---------------------------------------------------------------------------
