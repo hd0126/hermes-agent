@@ -1563,6 +1563,7 @@ For unattended gateway / server deployments, enable hard stops so a stuck agent 
 tool_loop_guardrails:
   warnings_enabled: true       # inject warnings into tool results (default: true)
   hard_stop_enabled: false     # also BLOCK the call past the hard-stop threshold (default: false)
+  freshness_safe_reads: false  # opt in to post-result read/poll checks (default: false)
   warn_after:
     exact_failure: 2           # identical failing call repeated N times
     same_tool_failure: 3       # same tool failing N times (different args)
@@ -1571,12 +1572,43 @@ tool_loop_guardrails:
     exact_failure: 5
     same_tool_failure: 8
     idempotent_no_progress: 5
+    poll_no_progress: 12       # process poll/log/wait/list; freshness-safe mode only
   loop_caps:
     max_web_searches: 50       # max web_search calls per turn (0 = unlimited)
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
 ```
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
+
+### Freshness-safe repeated results
+
+Set both `freshness_safe_reads: true` and `hard_stop_enabled: true` to use the
+post-result circuit breaker. It permits each read to execute before judging its
+result, rather than rejecting a potential refresh based only on previous output.
+A changed result resets that call's streak. After five identical successful
+results from the same read and canonical arguments (the configurable
+`hard_stop_after.idempotent_no_progress` threshold), the current turn ends with an
+explicit guardrail explanation. `skill_view` participates alongside existing
+idempotent reads. Failures retain the existing exact/same-tool failure limits.
+
+Successful known mutating tools invalidate read observations, failed results
+reset the affected successful streak, and all counters reset for a new turn.
+Dynamic browser snapshots/console/image observations are exempt from identical
+successful-result stops. `process` actions `poll`, `log`, `wait`, and `list` use a
+separate identical-result limit, `hard_stop_after.poll_no_progress` (default 12).
+Changed process output resets that streak; process writes, kills, and unrelated
+actions are not classified as polling. Repeated successful arbitrary shell/code
+commands are not treated as idempotent: the guard cannot infer their effects.
+
+With hard stops disabled, the opt-in mode only warns. With freshness-safe mode
+disabled, legacy behavior is retained. Already-dispatched concurrent calls are
+not cancelled; the halt applies at the tool-batch/turn boundary. This guard does
+not replace tool permissions, approval gates, process timeouts, or result limits.
+
+These settings are captured when an agent is constructed. Existing cached
+agents may retain earlier settings; code changes require restarting the running
+process through the installation's verified update/restart procedure. Do not
+infer live activation from a config file or a passing offline test alone.
 
 ### Per-turn runaway-loop caps
 

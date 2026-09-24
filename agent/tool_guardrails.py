@@ -38,6 +38,30 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
     }
 )
 
+DYNAMIC_BROWSER_OBSERVATION_TOOL_NAMES = frozenset(
+    {
+        "browser_snapshot",
+        "browser_console",
+        "browser_get_images",
+    }
+)
+
+FRESHNESS_SAFE_READ_TOOL_NAMES = frozenset(
+    {
+        "skill_view",
+    }
+)
+
+PROCESS_POLL_ACTIONS = frozenset(
+    {
+        "poll",
+        "log",
+        "wait",
+        "list",
+    }
+)
+
+
 MUTATING_TOOL_NAMES = frozenset(
     {
         "terminal",
@@ -77,6 +101,8 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    freshness_safe_reads: bool = False
+    poll_no_progress_block_after: int = 12
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
@@ -121,6 +147,13 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            freshness_safe_reads=_as_bool(
+                data.get("freshness_safe_reads"), defaults.freshness_safe_reads
+            ),
+            poll_no_progress_block_after=_positive_int(
+                hard_stop_after.get("poll_no_progress", data.get("poll_no_progress_block_after")),
+                defaults.poll_no_progress_block_after,
             ),
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
         )
@@ -281,6 +314,8 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._fresh_success: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._poll_success: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -305,6 +340,9 @@ class ToolCallGuardrailController:
         if cap_block is not None:
             return cap_block
 
+        if self.config.freshness_safe_reads and self._halt_decision is not None:
+            return self._halt_decision
+
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -325,7 +363,7 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
+        if self._is_idempotent(tool_name) and not self.config.freshness_safe_reads:
             record = self._no_progress.get(signature)
             if record is not None:
                 _result_hash, repeat_count = record
@@ -364,6 +402,8 @@ class ToolCallGuardrailController:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
             self._no_progress.pop(signature, None)
+            self._fresh_success.pop(signature, None)
+            self._poll_success.pop(signature, None)
 
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
@@ -412,7 +452,20 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
+        if self.config.freshness_safe_reads and self._is_process_poll(tool_name, args):
+            return self._record_fresh_success(
+                tool_name,
+                signature,
+                result,
+                self._poll_success,
+                self.config.poll_no_progress_block_after,
+                "poll_repeated_success_halt",
+            )
+
         if not self._is_idempotent(tool_name):
+            if self._is_mutating(tool_name):
+                self._fresh_success.clear()
+                self._poll_success.clear()
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -422,6 +475,71 @@ class ToolCallGuardrailController:
         if previous is not None and previous[0] == result_hash:
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
+
+        if not self.config.freshness_safe_reads:
+            if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
+                return ToolGuardrailDecision(
+                    action="warn",
+                    code="idempotent_no_progress_warning",
+                    message=(
+                        f"{tool_name} returned the same result {repeat_count} times. "
+                        "Use the result already provided or change the query instead of "
+                        "repeating it unchanged."
+                    ),
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+            return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+
+        if self._is_dynamic_browser_observation(tool_name):
+            self._fresh_success.pop(signature, None)
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+        return self._record_fresh_success(
+            tool_name,
+            signature,
+            result,
+            self._fresh_success,
+            self.config.no_progress_block_after,
+            "idempotent_repeated_success_halt",
+        )
+
+    def _record_fresh_success(
+        self,
+        tool_name: str,
+        signature: ToolCallSignature,
+        result: str | None,
+        records: dict[ToolCallSignature, tuple[str, int]],
+        block_after: int,
+        code: str,
+    ) -> ToolGuardrailDecision:
+        result_hash = _result_hash(result)
+        previous = records.get(signature)
+        repeat_count = 1
+        if previous is not None and previous[0] == result_hash:
+            repeat_count = previous[1] + 1
+        records[signature] = (result_hash, repeat_count)
+
+        if (
+            self.config.freshness_safe_reads
+            and self.config.hard_stop_enabled
+            and repeat_count >= block_after
+        ):
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code=code,
+                message=(
+                    f"Stopped {tool_name}: this read-only call returned the same "
+                    f"successful result {repeat_count} times with identical arguments. "
+                    "Use the result already provided or change strategy."
+                ),
+                tool_name=tool_name,
+                count=repeat_count,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
 
         if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
             return ToolGuardrailDecision(
@@ -442,7 +560,21 @@ class ToolCallGuardrailController:
     def _is_idempotent(self, tool_name: str) -> bool:
         if tool_name in self.config.mutating_tools:
             return False
+        if self.config.freshness_safe_reads and tool_name in FRESHNESS_SAFE_READ_TOOL_NAMES:
+            return True
         return tool_name in self.config.idempotent_tools
+
+    def _is_mutating(self, tool_name: str) -> bool:
+        return tool_name in self.config.mutating_tools
+
+    def _is_dynamic_browser_observation(self, tool_name: str) -> bool:
+        return tool_name in DYNAMIC_BROWSER_OBSERVATION_TOOL_NAMES
+
+    def _is_process_poll(self, tool_name: str, args: Mapping[str, Any]) -> bool:
+        if tool_name != "process":
+            return False
+        value = args.get("action")
+        return isinstance(value, str) and value.strip().lower() in PROCESS_POLL_ACTIONS
 
     def _check_loop_cap(
         self,
