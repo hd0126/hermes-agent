@@ -61,6 +61,12 @@ PROCESS_POLL_ACTIONS = frozenset(
     }
 )
 
+# A nonzero result can be ordinary diagnostic output. Different commands or
+# resources are not exact replays; the exact-failure limit still protects them.
+FAILURE_TOLERANT_TOOL_NAMES = frozenset(
+    {"terminal", "execute_code", "process", "browser_navigate", "web_extract"}
+)
+
 
 MUTATING_TOOL_NAMES = frozenset(
     {
@@ -408,7 +414,15 @@ class ToolCallGuardrailController:
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
 
-            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
+            diagnostic_iteration = (
+                self.config.freshness_safe_reads
+                and tool_name in FAILURE_TOLERANT_TOOL_NAMES
+            )
+            if (
+                self.config.hard_stop_enabled
+                and not diagnostic_iteration
+                and same_count >= self.config.same_tool_failure_halt_after
+            ):
                 decision = ToolGuardrailDecision(
                     action="halt",
                     code="same_tool_failure_halt",
@@ -464,6 +478,11 @@ class ToolCallGuardrailController:
 
         if not self._is_idempotent(tool_name):
             if self._is_mutating(tool_name):
+                if self.config.freshness_safe_reads:
+                    # A successful possible mutation starts a new experiment.
+                    # Polling returns above; failed mutations never reach here.
+                    self._exact_failure_counts.clear()
+                    self._same_tool_failure_counts.clear()
                 self._fresh_success.clear()
                 self._poll_success.clear()
             self._no_progress.pop(signature, None)

@@ -70,3 +70,39 @@ def test_changed_file_is_re_read_before_any_no_progress_decision(tmp_path):
     assert observed == ['first', 'first', 'changed by another actor']
     assert result['final_response'] == 'done'
     assert result['turn_exit_reason'].startswith('text_response')
+
+
+def test_edit_then_failed_test_can_continue_past_aggregate_failure_limit(tmp_path):
+    config = _config()
+    config['tool_loop_guardrails']['hard_stop_after']['exact_failure'] = 2
+    config['tool_loop_guardrails']['hard_stop_after']['same_tool_failure'] = 3
+    agent = _make_agent('patch', 'terminal', max_iterations=20, config=config)
+    source = tmp_path / 'example.py'
+    source.write_text('initial')
+    responses = []
+    for i in range(6):
+        for name, args in [('patch', {'path': str(source), 'content': str(i)}),
+                           ('terminal', {'command': 'run-checks'})]:
+            responses.append(_mock_response(content='', finish_reason='tool_calls', tool_calls=[
+                _mock_tool_call(name, json.dumps(args), f'{name}-{i}')
+            ]))
+    responses.append(_mock_response(content='Checkpoint: tests still need work, progress saved.'))
+    agent.client.chat.completions.create.side_effect = responses
+
+    def dispatch(name, args, *unused_args, **unused_kwargs):
+        if name == 'patch':
+            source.write_text(args['content'])
+            return json.dumps({'success': True})
+        return json.dumps({'exit_code': 1})
+
+    with (
+        patch('run_agent.handle_function_call', side_effect=dispatch) as tool,
+        patch.object(agent, '_persist_session'),
+        patch.object(agent, '_save_trajectory'),
+        patch.object(agent, '_cleanup_task_resources'),
+    ):
+        result = agent.run_conversation('Iterate with actual edits; report unfinished tests honestly.')
+    assert tool.call_count == 12
+    assert source.read_text() == '5'
+    assert result['turn_exit_reason'].startswith('text_response')
+    assert 'tests still need work' in result['final_response']

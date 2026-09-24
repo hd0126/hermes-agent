@@ -131,6 +131,55 @@ def test_freshness_safe_changed_fifth_static_read_is_allowed_and_resets_streak()
     assert controller.halt_decision is None
 
 
+def test_successful_edit_resets_exact_and_aggregate_failure_streaks():
+    controller = _fresh_controller(exact_failure_block_after=2, same_tool_failure_halt_after=3)
+    args = {"command": "run-checks"}
+    for i in range(12):
+        assert controller.before_call("terminal", args).allows_execution
+        result = controller.after_call("terminal", args, '{"exit_code":1}', failed=True)
+        assert not result.should_halt
+        controller.after_call("patch", {"path": "example.py", "revision": i}, '{"success":true}', failed=False)
+    assert controller.before_call("terminal", args).allows_execution
+    assert controller.halt_decision is None
+
+
+def test_different_failed_diagnostic_commands_do_not_halt_in_safe_mode():
+    controller = _fresh_controller(same_tool_failure_halt_after=3)
+    for i in range(12):
+        result = controller.after_call("terminal", {"command": f"diagnostic-{i}"}, '{"exit_code":1}', failed=True)
+        assert not result.should_halt
+    assert controller.halt_decision is None
+
+
+def test_unchanged_failed_retry_is_still_blocked_without_progress():
+    controller = _fresh_controller(exact_failure_block_after=2)
+    args = {"command": "same-failing-check"}
+    for _ in range(2):
+        assert controller.before_call("terminal", args).allows_execution
+        controller.after_call("terminal", args, '{"exit_code":1}', failed=True)
+    assert controller.before_call("terminal", args).action == "block"
+
+
+def test_failed_edit_and_successful_poll_do_not_erase_failures():
+    controller = _fresh_controller(exact_failure_block_after=2)
+    args = {"command": "same-failing-check"}
+    for _ in range(2):
+        controller.after_call("terminal", args, '{"exit_code":1}', failed=True)
+    controller.after_call("patch", {"path": "example.py"}, '{"error":"not applied"}', failed=True)
+    controller.after_call("process", {"action": "poll", "session_id": "example"}, '{"status":"running"}', failed=False)
+    controller.after_call("read_file", {"path": "example.py"}, '{"content":"same"}', failed=False)
+    assert controller.before_call("terminal", args).action == "block"
+
+
+def test_legacy_distinct_failure_limit_is_unchanged():
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig(
+        hard_stop_enabled=True, freshness_safe_reads=False, same_tool_failure_halt_after=3,
+    ))
+    for i in range(3):
+        decision = controller.after_call("terminal", {"command": f"check-{i}"}, '{"exit_code":1}', failed=True)
+    assert decision.code == "same_tool_failure_halt"
+
+
 def test_freshness_safe_same_fifth_static_read_halts_after_success_and_blocks_next_call():
     controller = _fresh_controller(no_progress_block_after=5)
     args = {"path": "same.txt"}

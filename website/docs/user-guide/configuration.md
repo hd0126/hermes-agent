@@ -1593,6 +1593,15 @@ idempotent reads. Failures retain the existing exact/same-tool failure limits.
 
 Successful known mutating tools invalidate read observations, failed results
 reset the affected successful streak, and all counters reset for a new turn.
+In freshness-safe mode, a successful known mutating tool also resets failure
+streaks, so edit/test iterations are not counted as unchanged retries. Successful
+read-only process polls and failed edits do not reset other tools' failures.
+Distinct failures from `terminal`, `execute_code`, `process`, `browser_navigate`,
+and `web_extract` warn rather than hitting the aggregate same-tool failure stop;
+identical failed calls without intervening progress retain the exact-failure
+limit. This uses conservative tool classification, not proof of changed bytes:
+a successful command that may mutate state counts as progress. Other tools and
+the legacy mode retain their existing aggregate failure stop behavior.
 Dynamic browser snapshots/console/image observations are exempt from identical
 successful-result stops. `process` actions `poll`, `log`, `wait`, and `list` use a
 separate identical-result limit, `hard_stop_after.poll_no_progress` (default 12).
